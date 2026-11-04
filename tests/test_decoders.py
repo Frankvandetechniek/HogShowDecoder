@@ -76,22 +76,60 @@ class ValueBlobTests(unittest.TestCase):
         self.assertEqual(r.function_id, 0x494)
         self.assertEqual(r.palette_id, 0x37)
 
+    def test_fade_short_and_long_form(self):
+        # Hog 5 cue 1 after changing its fade to 5 s: short form TLV 02 = 0x50
+        short = bytes.fromhex("010700000000240140020150050a00c0000000000000e03fff00")
+        # 1.5 s cue: long form TLV 03 = 01 00 + u32 LE 300 (5 ms units)
+        long_ = bytes.fromhex("010700000000240180030601002c010000050a04c0cdcccccccccce03fff00")
+        out = parse_value_blob(b"\x00\x00" + T + b"\x01\xc5" + short + T + b"\x01\xc5" + long_ + E)
+        self.assertEqual([r.fade_seconds for r in out["records"]], [5.0, 1.5])
+        self.assertEqual(out["errors"], [])
+
+    def test_hog5_selection_section(self):
+        rec = bytes.fromhex("010700000000240140020100050a00c0000000000000e03fff00")
+        sel = bytes.fromhex(
+            "00000002"
+            "d7310014000000060000d73105460000001a00000010030000000400000005000000060000 00d733"
+            "d7310014000000060001d73105460000001a00000010010000000200000007000000080000 00d733"
+            "d733".replace(" ", ""))
+        out = parse_value_blob(b"\x00\x00" + T + b"\x01\xc5" + rec + E + sel)
+        self.assertEqual(out["errors"], [])
+        self.assertEqual(out["selections"], [{"index": 0, "ids": [3, 4, 5, 6]},
+                                             {"index": 1, "ids": [1, 2, 7, 8]}])
+
+    def test_empty_hog5_blob(self):
+        out = parse_value_blob(bytes.fromhex("0000d73300000000d733"))
+        self.assertEqual((out["records"], out["selections"], out["errors"]), ([], [], []))
+
+    def test_object_number(self):
+        from hogshow.model import hog_number
+        self.assertEqual(hog_number(struct.pack(">HH", 12, 5000)), "12.5")
+        self.assertEqual(hog_number(struct.pack(">HH", 1, 0)), "1")
+        self.assertIsNone(hog_number(struct.pack(">HH", 0xFFFF, 0)))
+
     def test_level_encoding(self):
         self.assertEqual(decode_level(0.5), 0.0)
         self.assertEqual(decode_level(0.53125), 100.0)
         self.assertIsNone(decode_level(168.0))
 
 
-SAMPLE = os.environ.get("HOG_SAMPLE")
+SAMPLES = [p for p in os.environ.get("HOG_SAMPLE", "").split(os.pathsep) if p]
 
 
-@unittest.skipUnless(SAMPLE and os.path.exists(SAMPLE), "set HOG_SAMPLE=/path/to/show.hog4show")
+@unittest.skipUnless(SAMPLES, "set HOG_SAMPLE=/path/a.hog4show:/path/b.hogshow")
 class SampleShowTests(unittest.TestCase):
     def test_load(self):
         from hogshow import Show
-        d = Show.load(SAMPLE).to_dict()
-        self.assertTrue(d["fixtures"])
-        self.assertTrue(d["groups"])
+        for path in SAMPLES:
+            with self.subTest(path=path):
+                d = Show.load(path).to_dict()
+                self.assertTrue(d["fixtures"])
+                self.assertTrue(d["groups"])
+                undecoded = [v for cl in d["cuelists"] for c in cl["cues"]
+                             for v in c.get("values", []) if "undecoded" in v]
+                undecoded += [v for p in d["palettes"] for v in p.get("values", [])
+                              if "undecoded" in v]
+                self.assertEqual(undecoded, [])
 
 
 if __name__ == "__main__":

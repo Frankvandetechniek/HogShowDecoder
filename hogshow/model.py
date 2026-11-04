@@ -31,13 +31,16 @@ OBJREF_CLASS = {2: "cuelist", 3: "cue"}  # tentative
 
 
 def hog_number(raw: bytes) -> Optional[str]:
-    """Hog object numbers are u16 major + u16 minor (0xFFFF major = unnumbered)."""
+    """Hog object numbers are u16 major + u16 minor/10000 (0xFFFF major = unnumbered)."""
     if raw is None or len(raw) != 4:
         return None
     major, minor = struct.unpack(">HH", raw)
     if major == 0xFFFF:
         return None
-    return f"{major}" if minor == 0 else f"{major}.{minor}"
+    if minor == 0:
+        return f"{major}"
+    # minor is in 1/10000 units: 12.5 is stored as (12, 5000)
+    return f"{major}.{minor:04d}".rstrip("0")
 
 
 def kind_names(mask: Optional[int]) -> List[str]:
@@ -83,17 +86,23 @@ def objrefs(node: xtti.Node):
 class Show:
     """Loaded show file. ``Show.load(path).to_dict()`` gives everything as JSON."""
 
-    def __init__(self, container, conn):
+    def __init__(self, container, conn, include_attic: bool = False):
         self.container = container
         self.conn = conn
+        self.include_attic = include_attic
         self.tables: Dict[str, Dict[int, dict]] = {}
         self._load_tables()
 
     # ------------------------------------------------------------------ loading
     @classmethod
-    def load(cls, path: str) -> "Show":
+    def load(cls, path: str, include_attic: bool = False) -> "Show":
+        """Load a .hog4show (Hog 4 OS) or .hogshow (Hog 5) file.
+
+        Rows with ``attic != 0`` are deleted objects kept for undo; they are
+        skipped unless ``include_attic`` is set.
+        """
         cont = read_container(path)
-        return cls(cont, cont.open_db())
+        return cls(cont, cont.open_db(), include_attic)
 
     def _load_tables(self):
         names = [r[0] for r in self.conn.execute(
@@ -125,8 +134,37 @@ class Show:
 
     def rows(self, table):
         for rid, d in sorted(self.tables.get(table, {}).items()):
-            if d.get("tree") is not None:
-                yield rid, d
+            if d.get("tree") is None:
+                continue
+            if d.get("attic") and not self.include_attic:
+                continue
+            yield rid, d
+
+    def live(self, table, rid):
+        """Row ``rid`` of ``table`` if it exists and is not in the attic."""
+        d = self.tables.get(table, {}).get(rid)
+        if d is None or d.get("tree") is None:
+            return None
+        if d.get("attic") and not self.include_attic:
+            return None
+        return d
+
+    def format_info(self) -> dict:
+        """Container / serialisation versions (Hog 4 OS vs Hog 5 differences)."""
+        xver = {}
+        for t, rows in self.tables.items():
+            for d in rows.values():
+                v = d.get("xver")
+                key = "none (Hog 4 OS layout, no xver column)" if v is None else str(v)
+                xver[key] = xver.get(key, 0) + 1
+        attic = sum(1 for rows in self.tables.values() for d in rows.values() if d.get("attic"))
+        ident = self.container.ident or {}
+        return {
+            "archive_xtti_version": ident.get("xtti_version"),
+            "show_version": ident.get("show_version"),
+            "row_xver_counts": xver,
+            "attic_rows": attic,
+        }
 
     # ------------------------------------------------------------- lookups
     def function_names(self) -> Dict[int, str]:
@@ -141,8 +179,10 @@ class Show:
         meta = {r[0]: r for r in self.conn.execute(
             "select id, origin, footprint, bypass, product from metatypes")} \
             if "metatypes" in self.tables else {}
-        for r in self.conn.execute("select id, name, mfr, rev, status, uuid, protocols from types"):
-            tid, name, mfr, rev, status, uuid, proto = r
+        for r in self.conn.execute("select id, name, mfr, rev, status, uuid, protocols, attic from types"):
+            tid, name, mfr, rev, status, uuid, proto, attic = r
+            if attic and not self.include_attic:
+                continue
             m = meta.get(tid)
             out[tid] = {
                 "id": tid, "name": name, "manufacturer": m[1] if m else None,
@@ -192,12 +232,11 @@ class Show:
 
     def groups(self, fixtures=None) -> List[dict]:
         fixtures = fixtures or self.fixtures()
-        bodies = self.tables.get("groupbodies", {})
         out = []
         for rid, d in self.rows("groups"):
             g = {"id": rid, **identity(d["tree"]), "members": []}
-            body = bodies.get(rid)
-            if body and body.get("tree") is not None:
+            body = self.live("groupbodies", rid)
+            if body:
                 g["members"] = self._group_members(body["tree"], fixtures)
             out.append(g)
         return out
@@ -221,7 +260,31 @@ class Show:
         members.sort(key=lambda m: m["order"])
         return members
 
-    def _programming(self, tree: xtti.Node, fixtures, types, fnames) -> List[dict]:
+    def _all_fixtures(self) -> Dict[int, dict]:
+        """Fixture id -> {number, type, deleted}, including attic (deleted) fixtures.
+
+        Cues can still hold values for a fixture that was deleted from the show.
+        """
+        if getattr(self, "_fx_all", None) is None:
+            prev, self.include_attic = self.include_attic, True
+            try:
+                allfx = self.fixtures()
+            finally:
+                self.include_attic = prev
+            for fid, f in allfx.items():
+                f["deleted"] = bool(self.tables["fixtures"][fid].get("attic"))
+            self._fx_all = allfx
+        return self._fx_all
+
+    def _programming(self, tree: xtti.Node, fixtures, types, fnames, sel_out=None,
+                     scope: str = "fixture") -> List[dict]:
+        """Decode a body's value records.
+
+        ``scope`` says what a record's target id refers to: ``"fixture"`` for cues and
+        scenes, ``"type"`` for palettes (fixture and type ids overlap, so this can't be
+        inferred from the id).  0x3FE is always "any fixture".
+        """
+        allfx = self._all_fixtures()
         out = []
         for n in tree.find_type(T_VALUE_BLOB):
             parsed = parse_value_blob(n.raw)
@@ -230,23 +293,31 @@ class Show:
                 tgt = rec.target
                 if tgt == TARGET_ANY:
                     d["target_kind"] = "any"
-                elif tgt in fixtures:
-                    d["target_kind"] = "fixture"
-                    d["fixture_number"] = fixtures[tgt]["number"]
-                    d["fixture_type"] = fixtures[tgt]["type"]
-                elif tgt in types:
+                elif scope == "type":
                     d["target_kind"] = "fixture_type"
-                    d["fixture_type"] = types[tgt]["name"]
+                    d["fixture_type"] = types.get(tgt, {}).get("name")
+                else:
+                    d["target_kind"] = "fixture"
+                    fx = allfx.get(tgt)
+                    if fx:
+                        d["fixture_number"] = fx["number"]
+                        d["fixture_type"] = fx["type"]
+                        if fx["deleted"]:
+                            d["fixture_deleted"] = True
                 d["function"] = fnames.get(rec.function_id)
                 out.append(d)
             for e in parsed["errors"]:
                 out.append({"undecoded": e})
+            if sel_out is not None:
+                for sel in parsed.get("selections", []):
+                    ids = sel.get("ids", [])
+                    sel_out.append({**sel, "fixture_numbers": [
+                        allfx[i]["number"] if i in allfx else None for i in ids]})
         return out
 
     def palettes(self, fixtures=None) -> List[dict]:
         fixtures = fixtures or self.fixtures()
         types, fnames = self.fixture_types(), self.function_names()
-        bodies = self.tables.get("palettebodies", {})
         names = {r: d for r, d in self.rows("palettes")}
         out = []
         for rid, d in names.items():
@@ -255,24 +326,23 @@ class Show:
                 continue
             mask = kind_of(d["tree"])
             p = {"id": rid, **ident, "kind_mask": mask, "kind": kind_names(mask)}
-            body = bodies.get(rid)
-            if body and body.get("tree") is not None:
-                p["values"] = self._programming(body["tree"], fixtures, types, fnames)
+            body = self.live("palettebodies", rid)
+            if body:
+                p["values"] = self._programming(body["tree"], fixtures, types, fnames, scope="type")
             out.append(p)
         return out
 
     def scenes(self, fixtures=None) -> List[dict]:
         fixtures = fixtures or self.fixtures()
         types, fnames = self.fixture_types(), self.function_names()
-        bodies = self.tables.get("scenebodies", {})
         out = []
         for rid, d in self.rows("scenes"):
             ident = identity(d["tree"])
             if not ident:
                 continue
             s = {"id": rid, **ident}
-            body = bodies.get(rid)
-            if body and body.get("tree") is not None:
+            body = self.live("scenebodies", rid)
+            if body:
                 s["values"] = self._programming(body["tree"], fixtures, types, fnames)
             out.append(s)
         return out
@@ -292,11 +362,41 @@ class Show:
         rec(tree, [])
         return out
 
+    @staticmethod
+    def cue_timing(tree: xtti.Node) -> dict:
+        """Cue timing block (field 0x1C4).
+
+        Confirmed by diffing two Hog 5 shows where only cue 1's fade changed 0 -> 5 s:
+        ``0x166``, ``0x167`` and both halves of ``0x64F[0]`` changed 0 -> 5000 ms.
+        ``0x650`` stayed 0 and is taken to be the delay (not yet confirmed).
+        Times are type 0x33 (milliseconds) wrapped in a 0x152 struct (field 0x15D).
+        """
+        tm = tree.get(0x1C4)
+        if tm is None:
+            return {}
+
+        def ms(n):
+            v = n.get(0x15D) if n is not None else None
+            return v.i32() / 1000.0 if v is not None and v.raw is not None else None
+
+        def pairs(fid):
+            a = tm.get(fid)
+            if a is None:
+                return None
+            return [{"in": ms(e.get(0x15E)), "out": ms(e.get(0x15F))} for e in a.children]
+
+        out = {"fade_in": ms(tm.get(0x166)), "fade_out": ms(tm.get(0x167))}
+        f, dl = pairs(0x64F), pairs(0x650)
+        if f is not None:
+            out["fade"] = f
+        if dl is not None:
+            out["delay"] = dl
+        return out
+
     def cuelists(self, fixtures=None) -> List[dict]:
         fixtures = fixtures or self.fixtures()
         types, fnames = self.fixture_types(), self.function_names()
         cue_rows = dict(self.rows("cues"))
-        cue_bodies = self.tables.get("cuebodies", {})
         out = []
         for rid, d in self.rows("cuelists"):
             ident = identity(d["tree"])
@@ -312,10 +412,14 @@ class Show:
                 if not crow:
                     continue
                 cue = {"id": cid, **identity(crow["tree"]),
+                       "timing": self.cue_timing(crow["tree"]),
                        "times_seconds": self._times(crow["tree"])}
-                body = cue_bodies.get(cid)
-                if body and body.get("tree") is not None:
-                    cue["values"] = self._programming(body["tree"], fixtures, types, fnames)
+                body = self.live("cuebodies", cid)
+                if body:
+                    sels = []
+                    cue["values"] = self._programming(body["tree"], fixtures, types, fnames, sels)
+                    if sels:
+                        cue["selections"] = sels
                 cl["cues"].append(cue)
             out.append(cl)
         return out
@@ -343,8 +447,10 @@ class Show:
         fixtures = self.fixtures()
         return {
             "ident": self.container.ident,
+            "format": self.format_info(),
             "software": next(iter(self.versioning().values()), {}).get("software_version"),
-            "table_counts": {t: len(r) for t, r in sorted(self.tables.items())},
+            "table_counts": {t: sum(1 for d in r.values() if self.include_attic or not d.get("attic"))
+                             for t, r in sorted(self.tables.items())},
             "fixture_types": list(self.fixture_types().values()),
             "functions": [{"id": k, "name": v} for k, v in sorted(self.function_names().items())],
             "fixtures": list(fixtures.values()),

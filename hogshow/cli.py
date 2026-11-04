@@ -1,6 +1,6 @@
 """Command line interface::
 
-    python -m hogshow SHOW.hog4show                 # summary to stdout
+    python -m hogshow SHOW.hog4show                 # summary to stdout (Hog 5 .hogshow works too)
     python -m hogshow SHOW.hog4show -o outdir       # write show.json, raw.json, dump.txt, database
 """
 from __future__ import annotations
@@ -16,7 +16,9 @@ from .model import Show
 def _summary(show: dict) -> str:
     L = []
     ident = show.get("ident") or {}
-    L.append(f"Show: {ident.get('description', '?')}  software={show.get('software')}")
+    fmt = show.get("format", {})
+    L.append(f"Show: {ident.get('description', '?')}  software={show.get('software')}  "
+             f"archive xtti_version={fmt.get('archive_xtti_version')}  row xver={fmt.get('row_xver_counts')}")
     L.append(f"\nFixture types ({len(show['fixture_types'])}):")
     for t in show["fixture_types"]:
         L.append(f"  [{t['id']}] {t['name']}  ({t['manufacturer']}, footprint {t['footprint']})")
@@ -36,18 +38,22 @@ def _summary(show: dict) -> str:
     for cl in show["cuelists"]:
         L.append(f"  {cl.get('number')}  {cl.get('name')}  ({len(cl['cues'])} cues)")
         for c in cl["cues"]:
-            L.append(f"    cue {c.get('number')}  {c.get('name')}  ({len(c.get('values', []))} values)")
+            t = c.get("timing", {})
+            L.append(f"    cue {c.get('number'):>6}  fade {t.get('fade_in')}/{t.get('fade_out')}s"
+                     f"  {c.get('name')}  ({len(c.get('values', []))} values)")
     return "\n".join(L)
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Read / decompile Hog 4 (.hog4show) show files")
-    ap.add_argument("show", help=".hog4show file (or an extracted hogdatabase.mk2)")
+    ap = argparse.ArgumentParser(description="Read / decompile Hog 4 OS (.hog4show) and Hog 5 (.hogshow) show files")
+    ap.add_argument("show", help=".hog4show / .hogshow file (or an extracted hogdatabase.mk2)")
     ap.add_argument("-o", "--out", help="output directory")
     ap.add_argument("--json", action="store_true", help="print the decoded show as JSON to stdout")
+    ap.add_argument("--include-attic", action="store_true",
+                    help="also include deleted objects kept in the attic (undo history)")
     args = ap.parse_args(argv)
 
-    s = Show.load(args.show)
+    s = Show.load(args.show, include_attic=args.include_attic)
     data = s.to_dict()
     if args.json:
         json.dump(data, sys.stdout, indent=2, default=str)

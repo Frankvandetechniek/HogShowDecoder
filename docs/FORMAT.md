@@ -1,8 +1,34 @@
 # Hog 4 / Hog OS show file format (`.hog4show`)
 
-This is reverse engineered from a show saved by Hog OS **v5.2.0 (build 212)**
-(`xtti_version` 29). There is no public spec. Items marked **(?)** are
-educated guesses and need confirming against more show files.
+This is reverse engineered from three show files. There is no public spec.
+Items marked **(?)** are educated guesses and need confirming against more
+show files.
+
+| file | software | archive `xtti_version` | row `xver` |
+|------|----------|------------------------|------------|
+| `UE5_Music03_bck.hog4show` | Hog 4 PC | 29 | no column |
+| `Music03_Test_Latest.hogshow` | Hog 5 PC | 30 | 28 and 30 mixed |
+| `Music03_Test_Latest_cue1_fade_different.hogshow` | Hog 5 PC | 30 | same file with cue 1 fade 0 → 5 s |
+
+## 0. Hog 4 vs Hog 5
+
+Both versions use the same container, the same SQLite tables and the same XTTI
+encoding. One reader handles both. The differences found:
+
+| | Hog 4 (`.hog4show`) | Hog 5 (`.hogshow`) |
+|---|---|---|
+| file extension | `.hog4show` | `.hogshow` |
+| `hog_ident.json` `xtti_version` | 29 | 30 |
+| per-row `xver` column | absent | `xver INTEGER NOT NULL DEFAULT 28` on every table. It holds the XTTI version the row was written with, so one show can mix 28 and 30 rows. |
+| programming data blob (§3) | records + `D7 33` | records + `D7 33` + a *selection section* + `D7 33` (rows with xver 30) |
+| per-value fade TLV in cues | short form `02` only seen | short form `02` and long form `03` |
+| entry byte high nibble in cues | 0x00 | 0x20 |
+
+Rows with `attic = 1` are **deleted objects** kept for undo. The Hog 5 test show
+has a deleted cue list 1 (row 1) next to the live one (row 2), and 23 deleted
+fixtures. The reader skips attic rows unless you pass `--include-attic`.
+Cues can still hold values for deleted fixtures; those values are flagged
+`fixture_deleted`.
 
 ## 1. Layers
 
@@ -38,7 +64,8 @@ There are 52 tables, and almost all of them have the same layout:
 | `id`       | object id. The ids for fixtures, types and functions are referenced from other objects. |
 | `sequence` | change counter / revision |
 | `xtti`     | the object, serialised as XTTI (see §2) |
-| `attic`    | non-zero = object is in the "attic" (deleted / undo history) **(?)** |
+| `attic`    | 1 = deleted object kept in the "attic" (undo history). Skip these for the live show. |
+| `xver`     | Hog 5 only: XTTI version of this row (28, 30, …) |
 
 `types`, `metatypes` and `compound_types` also have plain columns
 (`name`, `mfr`, `uuid`, `origin`, `footprint`, `product` …). `versioning`
@@ -96,7 +123,7 @@ Leaf encodings that were identified:
 | 0x16, 0x15, 0x20, 0x36, … | u32 / i32 (`ffffffff` = none) |
 | 0x33 | time in **milliseconds** (i32), e.g. `0x7d0` = 2.0 s |
 | 0x22, 0x23 | string: `count:u32` + UTF-16BE |
-| 0x21 | Hog object number: `major:u16 minor:u16`. `ffff` = unnumbered. 3 = `00030000` |
+| 0x21 | Hog object number: `major:u16 minor:u16`, minor in 1/10000. `ffff` = unnumbered. 3 = `00030000`, 12.5 = `000c1388` |
 | 0x6cf, 0x672 | IEEE double |
 | 0x64 | object reference `(class:u32, id:u32)`. Class 2 = cue list, 3 = cue **(?)** |
 
@@ -144,15 +171,23 @@ The body holds one leaf (type **0x1C7**, field 0x397) in a packed
 **little-endian** format:
 
 ```
-header:u16                 0x0001 (palettes) / 0x0100 (cues)
+header:u16                 0x0001 / 0x0000 (palettes), 0x0100 / 0x0000 (cues)
 record*                    D7 31 01 C5 <record>
+D7 33
+[xver 30 / Hog 5 only]
+count:u32
+count x ( D7 31 00 14 len:u32 index:u16
+          D7 31 05 46 len:u32 nbytes:u32 BE  fixture_id:u32 LE * (nbytes/4)  D7 33 )
 D7 33
 
 record :=
   rtype:u16                0x0701 = value entry, 0x1300 = palette reference
-  target:u32               fixture id (cues) | fixture TYPE id (palettes) | 0x3FE = any fixture
-  entry:u8                 low nibble: 1 = palette ref, 4 = value, 5 = effect, 7 = ? ; bit 0x40 = flag
-  function:u16             function id in the low 14 bits; bits 0xC000 = flags
+  target:u32               cues/scenes: fixture id. palettes: fixture TYPE id. 0x3FE = any fixture.
+                           Fixture and type ids overlap, so the context decides which.
+  entry:u8                 low nibble: 1 = palette ref, 4 = value, 5 = effect, 7 = ?
+                           high nibble: 0x40 palettes, 0x00 Hog 4 cues, 0x20 Hog 5 cues (?)
+  function:u16             function id in the low 14 bits
+                           bit 0x4000 = short fade TLV 02 follows, bit 0x8000 = long fade TLV 03 follows
   [entry==1] u32(-1) palette_id:u32 u32(-1)
   TLV*                     tag:u8 len:u8 data
   FF 00
@@ -163,7 +198,8 @@ record :=
 | 0x05 | 10 | value: `flags:u16, value:f64` |
 | 0x07 | 28 | effect: `u32, effect_table:u32, f64, u16, u16, f64` **(?)** |
 | 0x08 | 2  | unknown, used with entry kind 7 |
-| 0x02 | 1  | unknown (always 0x20, cues only) |
+| 0x02 | 1  | per-value fade, short form: seconds × 16 (0x00 = 0 s, 0x10 = 1 s, 0x20 = 2 s, 0x50 = 5 s). Cues only. **Confirmed** by the fade test file. |
+| 0x03 | 6  | per-value fade, long form: `u16 (=1), time:u32 LE` in 5 ms units (20 = 0.1 s, 300 = 1.5 s). Used when the fade isn't a whole second. |
 | 0x09 | 2  | unknown (on palette references) |
 
 **Value scaling.** Percentage values are stored as `0.5 + fraction/32`:
@@ -183,9 +219,25 @@ encoding: a 0..100 % range is stored as min `3FE0…` and max `3FE1…`.
 * The cue list's cues are the object refs `(3, cue_id)` under field `0x1D1`.
 * Cue list options are under `0x5CD`. The default times there are type 0x33
   values in ms.
-* Cue timing is under `0x1C4`. Fields `0x166` and `0x167` are probably
-  fade and delay **(?)**. Arrays `0x64F` and `0x650` hold per-category
-  times **(?)**.
+* Cue timing is under `0x1C4`. Each time is a `0x152` struct holding field
+  `0x15D` (type 0x33, milliseconds).
+
+  | field | meaning | status |
+  |-------|---------|--------|
+  | `0x166` | fade in | **confirmed**: 0 → 5000 when the cue fade was set to 5 s |
+  | `0x167` | fade out | **confirmed**: changed together with 0x166 |
+  | `0x64F[]` | fade, as `{0x15E: in, 0x15F: out}` | **confirmed**: both changed 0 → 5000 |
+  | `0x650[]` | delay, as `{0x15E: in, 0x15F: out}` | **(?)**: stayed 0 in the test |
+  | `0x651[]` | path | **(?)** |
+
+  Which of `0x166` and `0x167` is "in" and which is "out" still needs a split
+  fade to prove it (e.g. `Fade 3/5`). The same fade is also copied into every
+  value in the cue body (TLV 02/03 above).
+* Cue list option `0x747` = number of cues.
+* Hog 5 cue bodies have a *selection section* after the records: a list of
+  `(index, [fixture ids])`. In the test show it holds sub-selections such as
+  `[1,8] [2,7] [3,6] [4,5]`, which look like the fan/buddy order the cue was
+  programmed with **(?)**.
 
 ### Pages (`pages` 0x1D7)
 `0x203[]` master slots. Each slot holds an object ref (class 2 = cue list)
