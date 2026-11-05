@@ -22,7 +22,7 @@ python -m hogshow MyShow.hogshow                  # Hog 5 show files work the sa
 python -m hogshow MyShow.hogshow --include-attic  # also show deleted objects (undo history)
 ```
 
-Or install it (wheels are attached to each [GitHub release](https://github.com/FrankDeRuiterNL/HogShowExtractor/releases)) and use the `hogshow` command:
+Or install it (wheels are attached to each [GitHub release](https://github.com/Frankvandetechniek/HogShowDecoder/releases)) and use the `hogshow` command:
 
 ```bash
 pip install hogshowdecoder-0.1.0-py3-none-any.whl
