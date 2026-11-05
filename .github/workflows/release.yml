@@ -1,10 +1,14 @@
 name: Release
 
-# Push a tag like v0.1.0 to publish a GitHub release.
+# Two ways to publish a GitHub release:
+#  * push a tag like v0.1.0, or
+#  * run this workflow by hand (Actions tab -> Release -> Run workflow); it then
+#    creates the tag v<hogshow.__version__> on the selected commit itself.
 # Release notes are read from .github/release-notes/<tag>.md when that file exists.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -19,13 +23,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check tag matches package version
+      - name: Work out the release tag
         run: |
           version=$(python -c "import hogshow; print(hogshow.__version__)")
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match hogshow.__version__ ($version)"
-            exit 1
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+              echo "Tag $GITHUB_REF_NAME does not match hogshow.__version__ ($version)"
+              exit 1
+            fi
           fi
+          echo "TAG=v$version" >> "$GITHUB_ENV"
 
       - name: Run tests
         run: python -m unittest discover -s tests -v
@@ -39,9 +46,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes=".github/release-notes/${GITHUB_REF_NAME}.md"
-          if [ -f "$notes" ]; then
-            gh release create "$GITHUB_REF_NAME" dist/* --title "HogShowDecoder $GITHUB_REF_NAME" --notes-file "$notes"
-          else
-            gh release create "$GITHUB_REF_NAME" dist/* --title "HogShowDecoder $GITHUB_REF_NAME" --generate-notes
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG already exists"
+            exit 1
           fi
+          notes=".github/release-notes/${TAG}.md"
+          if [ -f "$notes" ]; then
+            notes_args=(--notes-file "$notes")
+          else
+            notes_args=(--generate-notes)
+          fi
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" \
+            --title "HogShowDecoder $TAG" "${notes_args[@]}"
