@@ -1,4 +1,4 @@
-# HogShowExtractor
+# HogShowDecoder
 
 A reader / "decompiler" for **Hog 4 OS (`.hog4show`) and Hog 5 (`.hogshow`)
 show files**. It lets other tools use the fixtures, patch, groups, palettes,
