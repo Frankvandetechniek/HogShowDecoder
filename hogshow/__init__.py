@@ -2,4 +2,6 @@
 from .model import Show
 from .container import read_container
 
-__all__ = ["Show", "read_container"]
+__version__ = "0.1.0"
+
+__all__ = ["Show", "read_container", "__version__"]

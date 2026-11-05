@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hogshowdecoder"
+dynamic = ["version"]
+description = "Reader / decompiler for Hog 4 OS (.hog4show) and Hog 5 (.hogshow) lighting console show files"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+hogshow = "hogshow.cli:main"
+
+[tool.setuptools]
+packages = ["hogshow"]
+
+[tool.setuptools.dynamic]
+version = {attr = "hogshow.__version__"}
